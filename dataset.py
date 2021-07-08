@@ -41,13 +41,13 @@ class DatasetImageCoord(Dataset):
         position = self.positions[idx]
 
         img_path = os.path.join(self.data_path,img_file_name,"{}.jpg".format(img_file_name)
-        image, size = load_image(img_file_name)
+        image, dim = load_image(img_file_name)
 
         # normalize the coord 
-        position[0] = position[0] / size[0]
-        position[1] = position[1] / size[1]
+        position[0] = position[0] / dim[0]
+        position[1] = position[1] / dim[1]
 
-        return img_file_name, position
+        return image, position
 
 
 def load_image(path):

@@ -1,470 +1,168 @@
-from torch import nn
 import torch
-from torchvision import models
-import torchvision
+from torch import nn
 from torch.nn import functional as F
+import os 
+import numpy as np
 
+class ConvBlock(nn.Module):
+    """
+    A Convolutional Block that consists of two convolution layers each followed by
+    instance normalization, relu activation and dropout.
+    """
 
-def conv3x3(in_, out):
-    return nn.Conv2d(in_, out, 3, padding=1)
-
-
-class Conv3BN(nn.Module):
-    def __init__(self, in_: int, out: int, bn=False):
+    def __init__(self, in_chans, out_chans, drop_prob):
+        """
+        Args:
+            in_chans (int): Number of channels in the input.
+            out_chans (int): Number of channels in the output.
+            drop_prob (float): Dropout probability.
+        """
         super().__init__()
-        self.conv = conv3x3(in_, out)
-        self.bn = nn.BatchNorm2d(out) if bn else None
-        self.activation = nn.ReLU(inplace=True)
 
-    def forward(self, x):
-        x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        x = self.activation(x)
-        return x
+        self.in_chans = in_chans
+        self.out_chans = out_chans
+        self.drop_prob = drop_prob
+
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_chans, out_chans, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(out_chans),
+            nn.ReLU(),
+            nn.Dropout2d(drop_prob),
+            nn.Conv2d(out_chans, out_chans, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(out_chans),
+            nn.ReLU(),
+            nn.Dropout2d(drop_prob)
+        )
+
+    def forward(self, input):
+        """
+        Args:
+            input (torch.Tensor): Input tensor of shape [batch_size, self.in_chans, height, width]
+        Returns:
+            (torch.Tensor): Output tensor of shape [batch_size, self.out_chans, height, width]
+        """
+        return self.layers(input)
+
+    def __repr__(self):
+        return f'ConvBlock(in_chans={self.in_chans}, out_chans={self.out_chans}, ' \
+            f'drop_prob={self.drop_prob})'
 
 
-class UNetModule(nn.Module):
-    def __init__(self, in_: int, out: int):
+class UnetModel(nn.Module):
+    """
+    PyTorch implementation of a U-Net model.
+    This is based on:
+        Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks
+        for biomedical image segmentation. In International Conference on Medical image
+        computing and computer-assisted intervention, pages 234–241. Springer, 2015.
+    """
+
+    def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob):
+        """
+        Args:
+            in_chans (int): Number of channels in the input to the U-Net model.
+            out_chans (int): Number of channels in the output to the U-Net model.
+            chans (int): Number of output channels of the first convolution layer.
+            num_pool_layers (int): Number of down-sampling and up-sampling layers.
+            drop_prob (float): Dropout probability.
+        """
         super().__init__()
-        self.l1 = Conv3BN(in_, out)
-        self.l2 = Conv3BN(out, out)
 
-    def forward(self, x):
-        x = self.l1(x)
-        x = self.l2(x)
-        return x
+        self.in_chans = in_chans
+        self.out_chans = out_chans
+        self.chans = chans
+        self.num_pool_layers = num_pool_layers
+        self.drop_prob = drop_prob
 
+        self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
+        ch = chans
+        for i in range(num_pool_layers - 1):
+            self.down_sample_layers += [ConvBlock(ch, ch * 2, drop_prob)]
+            ch *= 2
+        self.conv = ConvBlock(ch, ch, drop_prob)
 
-class PsiNet(nn.Module):
-    """
-    Adapted from Vanilla UNet implementation - https://github.com/lopuhin/mapillary-vistas-2017/blob/master/unet_models.py
-    """
+        self.up_sample_layers = nn.ModuleList()
+        for i in range(num_pool_layers - 1):
+            self.up_sample_layers += [ConvBlock(ch * 2, ch // 2, drop_prob)]
+            ch //= 2
+        self.up_sample_layers += [ConvBlock(ch * 2, ch, drop_prob)]
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(ch, ch // 2, kernel_size=1),
+            nn.Conv2d(ch // 2, out_chans, kernel_size=1),
+            nn.Conv2d(out_chans, out_chans, kernel_size=1),
+        )
 
-    output_downscaled = 1
-    module = UNetModule
+    def forward(self, input):
+        """
+        Args:
+            input (torch.Tensor): Input tensor of shape [batch_size, self.in_chans, height, width]
+        Returns:
+            (torch.Tensor): Output tensor of shape [batch_size, self.out_chans, height, width]
+        """
+        stack = []
+        output = input
+        # Apply down-sampling layers
+        for layer in self.down_sample_layers:
+            output = layer(output)
+            stack.append(output)
+            output = F.max_pool2d(output, kernel_size=2)
 
-    def __init__(
-        self,
-        input_channels: int = 3,
-        filters_base: int = 32,
-        down_filter_factors=(1, 2, 4, 8, 16),
-        up_filter_factors=(1, 2, 4, 8, 16),
-        bottom_s=4,
-        num_classes=1,
-        add_output=True,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        assert len(down_filter_factors) == len(up_filter_factors)
-        assert down_filter_factors[-1] == up_filter_factors[-1]
-        down_filter_sizes = [filters_base * s for s in down_filter_factors]
-        up_filter_sizes = [filters_base * s for s in up_filter_factors]
-        self.down, self.up = nn.ModuleList(), nn.ModuleList()
-        self.down.append(self.module(input_channels, down_filter_sizes[0]))
-        for prev_i, nf in enumerate(down_filter_sizes[1:]):
-            self.down.append(self.module(down_filter_sizes[prev_i], nf))
-        for prev_i, nf in enumerate(up_filter_sizes[1:]):
-            self.up.append(
-                self.module(down_filter_sizes[prev_i] + nf, up_filter_sizes[prev_i])
-            )
-        pool = nn.MaxPool2d(2, 2)
-        pool_bottom = nn.MaxPool2d(bottom_s, bottom_s)
-        upsample1 = nn.Upsample(scale_factor=2)
-        upsample_bottom1 = nn.Upsample(scale_factor=bottom_s)
-        upsample2 = nn.Upsample(scale_factor=2)
-        upsample_bottom2 = nn.Upsample(scale_factor=bottom_s)
-        upsample3 = nn.Upsample(scale_factor=2)
-        upsample_bottom3 = nn.Upsample(scale_factor=bottom_s)
+        output = self.conv(output)
 
-        self.downsamplers = [None] + [pool] * (len(self.down) - 1)
-        self.downsamplers[-1] = pool_bottom
-        self.upsamplers1 = [upsample1] * len(self.up)
-        self.upsamplers1[-1] = upsample_bottom1
-        self.upsamplers2 = [upsample2] * len(self.up)
-        self.upsamplers2[-1] = upsample_bottom2
-        self.upsamplers3 = [upsample3] * len(self.up)
-        self.upsamplers3[-1] = upsample_bottom3
+        # Apply up-sampling layers
+        for layer in self.up_sample_layers:
+            output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
+            output = torch.cat([output, stack.pop()], dim=1)
+            output = layer(output)
+        return self.conv2(output)
 
-        self.add_output = add_output
-        if add_output:
-            self.conv_final1 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-        if add_output:
-            self.conv_final2 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-        if add_output:
-            self.conv_final3 = nn.Conv2d(up_filter_sizes[0], 1, 1)
+    
+class DataConsistencyLayer(nn.Module):
 
-    def forward(self, x):
-        xs = []
-        for downsample, down in zip(self.downsamplers, self.down):
-            x_in = x if downsample is None else downsample(xs[-1])
-            x_out = down(x_in)
-            xs.append(x_out)
+    def __init__(self,mask_path,acc_factor,device):
+        
+        super(DataConsistencyLayer,self).__init__()
 
-        x_out = xs[-1]
-        x_out1 = x_out
-        x_out2 = x_out
-        x_out3 = x_out
+        print (mask_path)
+        mask_path = os.path.join(mask_path,'mask_{}.npy'.format(acc_factor))
+        self.mask = torch.from_numpy(np.load(mask_path)).unsqueeze(2).unsqueeze(0).to(device)
 
-        # Decoder mask segmentation
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers1, self.up))
-        ):
-            x_out1 = upsample(x_out1)
-            x_out1 = up(torch.cat([x_out1, x_skip], 1))
+    def forward(self,us_kspace,predicted_img):
 
-        # Decoder contour estimation
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers2, self.up))
-        ):
-            x_out2 = upsample(x_out2)
-            x_out2 = up(torch.cat([x_out2, x_skip], 1))
+        # us_kspace     = us_kspace[:,0,:,:]
+        predicted_img = predicted_img[:,0,:,:]
+        
+        kspace_predicted_img = torch.rfft(predicted_img,2,True,False).double()
+        # print (us_kspace.shape,predicted_img.shape,kspace_predicted_img.shape,self.mask.shape)
+        
+        updated_kspace1  = self.mask * us_kspace 
+        updated_kspace2  = (1 - self.mask) * kspace_predicted_img
 
-        # Regression
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers3, self.up))
-        ):
-            x_out3 = upsample(x_out3)
-            x_out3 = up(torch.cat([x_out3, x_skip], 1))
+        
 
-        if self.add_output:
-            x_out1 = self.conv_final1(x_out1)
-            if self.num_classes > 1:
-                x_out1 = F.log_softmax(x_out1, dim=1)
-
-        if self.add_output:
-            x_out2 = self.conv_final2(x_out2)
-            if self.num_classes > 1:
-                x_out2 = F.log_softmax(x_out2, dim=1)
-
-        if self.add_output:
-            x_out3 = self.conv_final3(x_out3)
-            x_out3 = F.sigmoid(x_out3)
-
-        return [x_out1, x_out2, x_out3]
+        updated_kspace   = updated_kspace1[:,0,:,:,:] + updated_kspace2
+        
+        
+        updated_img    = torch.ifft(updated_kspace,2,True) 
+        
+        update_img_abs = torch.sqrt(updated_img[:,:,:,0]**2 + updated_img[:,:,:,1]**2)
+        
+        update_img_abs = update_img_abs.unsqueeze(1)
+        
+        return update_img_abs.float()
 
 
-class UNet_DCAN(nn.Module):
-    """
-    Adapted from Vanilla UNet implementation - https://github.com/lopuhin/mapillary-vistas-2017/blob/master/unet_models.py
-    """
+'''
+model = UnetModel(
+        in_chans=2,
+        out_chans=1,
+        chans=32,
+        num_pool_layers=4,
+        drop_prob = 0
+     )
 
-    output_downscaled = 1
-    module = UNetModule
-
-    def __init__(
-        self,
-        input_channels: int = 3,
-        filters_base: int = 32,
-        down_filter_factors=(1, 2, 4, 8, 16),
-        up_filter_factors=(1, 2, 4, 8, 16),
-        bottom_s=4,
-        num_classes=1,
-        add_output=True,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        assert len(down_filter_factors) == len(up_filter_factors)
-        assert down_filter_factors[-1] == up_filter_factors[-1]
-        down_filter_sizes = [filters_base * s for s in down_filter_factors]
-        up_filter_sizes = [filters_base * s for s in up_filter_factors]
-        self.down, self.up = nn.ModuleList(), nn.ModuleList()
-        self.down.append(self.module(input_channels, down_filter_sizes[0]))
-        for prev_i, nf in enumerate(down_filter_sizes[1:]):
-            self.down.append(self.module(down_filter_sizes[prev_i], nf))
-        for prev_i, nf in enumerate(up_filter_sizes[1:]):
-            self.up.append(
-                self.module(down_filter_sizes[prev_i] + nf, up_filter_sizes[prev_i])
-            )
-        pool = nn.MaxPool2d(2, 2)
-        pool_bottom = nn.MaxPool2d(bottom_s, bottom_s)
-        upsample1 = nn.Upsample(scale_factor=2)
-        upsample_bottom1 = nn.Upsample(scale_factor=bottom_s)
-        upsample2 = nn.Upsample(scale_factor=2)
-        upsample_bottom2 = nn.Upsample(scale_factor=bottom_s)
-
-        self.downsamplers = [None] + [pool] * (len(self.down) - 1)
-        self.downsamplers[-1] = pool_bottom
-        self.upsamplers1 = [upsample1] * len(self.up)
-        self.upsamplers1[-1] = upsample_bottom1
-        self.upsamplers2 = [upsample2] * len(self.up)
-        self.upsamplers2[-1] = upsample_bottom2
-
-        self.add_output = add_output
-        if add_output:
-            self.conv_final1 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-        if add_output:
-            self.conv_final2 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-
-    def forward(self, x):
-        xs = []
-        for downsample, down in zip(self.downsamplers, self.down):
-            x_in = x if downsample is None else downsample(xs[-1])
-            x_out = down(x_in)
-            xs.append(x_out)
-
-        x_out = xs[-1]
-        x_out1 = x_out
-        x_out2 = x_out
-
-        # Decoder mask segmentation
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers1, self.up))
-        ):
-            x_out1 = upsample(x_out1)
-            x_out1 = up(torch.cat([x_out1, x_skip], 1))
-
-        # Decoder contour estimation
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers2, self.up))
-        ):
-            x_out2 = upsample(x_out2)
-            x_out2 = up(torch.cat([x_out2, x_skip], 1))
-
-        if self.add_output:
-            x_out1 = self.conv_final1(x_out1)
-            if self.num_classes > 1:
-                x_out1 = F.log_softmax(x_out1, dim=1)
-
-        if self.add_output:
-            x_out2 = self.conv_final2(x_out2)
-            if self.num_classes > 1:
-                x_out2 = F.log_softmax(x_out2, dim=1)
-
-        return [x_out1, x_out2]
-
-
-class UNet_DMTN(nn.Module):
-    """
-    Adapted from Vanilla UNet implementation - https://github.com/lopuhin/mapillary-vistas-2017/blob/master/unet_models.py
-    """
-
-    output_downscaled = 1
-    module = UNetModule
-
-    def __init__(
-        self,
-        input_channels=3,
-        filters_base: int = 32,
-        down_filter_factors=(1, 2, 4, 8, 16),
-        up_filter_factors=(1, 2, 4, 8, 16),
-        bottom_s=4,
-        num_classes=1,
-        add_output=True,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        assert len(down_filter_factors) == len(up_filter_factors)
-        assert down_filter_factors[-1] == up_filter_factors[-1]
-        down_filter_sizes = [filters_base * s for s in down_filter_factors]
-        up_filter_sizes = [filters_base * s for s in up_filter_factors]
-        self.down, self.up = nn.ModuleList(), nn.ModuleList()
-        self.down.append(self.module(input_channels, down_filter_sizes[0]))
-        for prev_i, nf in enumerate(down_filter_sizes[1:]):
-            self.down.append(self.module(down_filter_sizes[prev_i], nf))
-        for prev_i, nf in enumerate(up_filter_sizes[1:]):
-            self.up.append(
-                self.module(down_filter_sizes[prev_i] + nf, up_filter_sizes[prev_i])
-            )
-        pool = nn.MaxPool2d(2, 2)
-        pool_bottom = nn.MaxPool2d(bottom_s, bottom_s)
-        upsample1 = nn.Upsample(scale_factor=2)
-        upsample_bottom1 = nn.Upsample(scale_factor=bottom_s)
-        upsample2 = nn.Upsample(scale_factor=2)
-        upsample_bottom2 = nn.Upsample(scale_factor=bottom_s)
-
-        self.downsamplers = [None] + [pool] * (len(self.down) - 1)
-        self.downsamplers[-1] = pool_bottom
-        self.upsamplers1 = [upsample1] * len(self.up)
-        self.upsamplers1[-1] = upsample_bottom1
-        self.upsamplers2 = [upsample2] * len(self.up)
-        self.upsamplers2[-1] = upsample_bottom2
-
-        self.add_output = add_output
-        if add_output:
-            self.conv_final1 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-        if add_output:
-            self.conv_final2 = nn.Conv2d(up_filter_sizes[0], 1, 1)
-
-    def forward(self, x):
-        xs = []
-        for downsample, down in zip(self.downsamplers, self.down):
-            x_in = x if downsample is None else downsample(xs[-1])
-            x_out = down(x_in)
-            xs.append(x_out)
-
-        x_out = xs[-1]
-        x_out1 = x_out
-        x_out2 = x_out
-
-        # Decoder mask segmentation
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers1, self.up))
-        ):
-            x_out1 = upsample(x_out1)
-            x_out1 = up(torch.cat([x_out1, x_skip], 1))
-
-        # Regression
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers2, self.up))
-        ):
-            x_out2 = upsample(x_out2)
-            x_out2 = up(torch.cat([x_out2, x_skip], 1))
-
-        if self.add_output:
-            x_out1 = self.conv_final1(x_out1)
-            if self.num_classes > 1:
-                x_out1 = F.log_softmax(x_out1, dim=1)
-
-        if self.add_output:
-            x_out2 = self.conv_final2(x_out2)
-            x_out2 = F.sigmoid(x_out2)
-
-        return [x_out1, x_out2]
-
-
-class UNet(nn.Module):
-    """
-    Vanilla UNet.
-
-    Implementation from https://github.com/lopuhin/mapillary-vistas-2017/blob/master/unet_models.py
-    """
-
-    output_downscaled = 1
-    module = UNetModule
-
-    def __init__(
-        self,
-        input_channels=3,
-        filters_base: int = 32,
-        down_filter_factors=(1, 2, 4, 8, 16),
-        up_filter_factors=(1, 2, 4, 8, 16),
-        bottom_s=4,
-        num_classes=1,
-        padding=1,
-        add_output=True,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        assert len(down_filter_factors) == len(up_filter_factors)
-        assert down_filter_factors[-1] == up_filter_factors[-1]
-        down_filter_sizes = [filters_base * s for s in down_filter_factors]
-        up_filter_sizes = [filters_base * s for s in up_filter_factors]
-        self.down, self.up = nn.ModuleList(), nn.ModuleList()
-        self.down.append(self.module(input_channels, down_filter_sizes[0]))
-        for prev_i, nf in enumerate(down_filter_sizes[1:]):
-            self.down.append(self.module(down_filter_sizes[prev_i], nf))
-        for prev_i, nf in enumerate(up_filter_sizes[1:]):
-            self.up.append(
-                self.module(down_filter_sizes[prev_i] + nf, up_filter_sizes[prev_i])
-            )
-        pool = nn.MaxPool2d(2, 2)
-        pool_bottom = nn.MaxPool2d(bottom_s, bottom_s)
-        upsample = nn.Upsample(scale_factor=2)
-        upsample_bottom = nn.Upsample(scale_factor=bottom_s)
-        self.downsamplers = [None] + [pool] * (len(self.down) - 1)
-        self.downsamplers[-1] = pool_bottom
-        self.upsamplers = [upsample] * len(self.up)
-        self.upsamplers[-1] = upsample_bottom
-        self.add_output = add_output
-        if add_output:
-            self.conv_final = nn.Conv2d(up_filter_sizes[0], num_classes, padding)
-
-    def forward(self, x):
-        xs = []
-        for downsample, down in zip(self.downsamplers, self.down):
-            x_in = x if downsample is None else downsample(xs[-1])
-            x_out = down(x_in)
-            xs.append(x_out)
-            # print(x_out.shape)
-
-        x_out = xs[-1]
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers, self.up))
-        ):
-            x_out = upsample(x_out)
-            x_out = up(torch.cat([x_out, x_skip], 1))
-            # print(x_out.shape)
-
-        if self.add_output:
-            x_out = self.conv_final(x_out)
-            # print(x_out.shape)
-            if self.num_classes > 1:
-                x_out = F.log_softmax(x_out, dim=1)
-
-        return [x_out]
-
-
-class UNet_ConvMCD(nn.Module):
-    """
-    Vanilla UNet.
-
-    Implementation from https://github.com/lopuhin/mapillary-vistas-2017/blob/master/unet_models.py
-    """
-
-    output_downscaled = 1
-    module = UNetModule
-
-    def __init__(
-        self,
-        input_channels: int = 3,
-        filters_base: int = 32,
-        down_filter_factors=(1, 2, 4, 8, 16),
-        up_filter_factors=(1, 2, 4, 8, 16),
-        bottom_s=4,
-        num_classes=1,
-        add_output=True,
-    ):
-        super().__init__()
-        self.num_classes = num_classes
-        assert len(down_filter_factors) == len(up_filter_factors)
-        assert down_filter_factors[-1] == up_filter_factors[-1]
-        down_filter_sizes = [filters_base * s for s in down_filter_factors]
-        up_filter_sizes = [filters_base * s for s in up_filter_factors]
-        self.down, self.up = nn.ModuleList(), nn.ModuleList()
-        self.down.append(self.module(input_channels, down_filter_sizes[0]))
-        for prev_i, nf in enumerate(down_filter_sizes[1:]):
-            self.down.append(self.module(down_filter_sizes[prev_i], nf))
-        for prev_i, nf in enumerate(up_filter_sizes[1:]):
-            self.up.append(
-                self.module(down_filter_sizes[prev_i] + nf, up_filter_sizes[prev_i])
-            )
-        pool = nn.MaxPool2d(2, 2)
-        pool_bottom = nn.MaxPool2d(bottom_s, bottom_s)
-        upsample = nn.Upsample(scale_factor=2)
-        upsample_bottom = nn.Upsample(scale_factor=bottom_s)
-        self.downsamplers = [None] + [pool] * (len(self.down) - 1)
-        self.downsamplers[-1] = pool_bottom
-        self.upsamplers = [upsample] * len(self.up)
-        self.upsamplers[-1] = upsample_bottom
-        self.add_output = add_output
-        if add_output:
-            self.conv_final1 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-            self.conv_final2 = nn.Conv2d(up_filter_sizes[0], num_classes, 1)
-            self.conv_final3 = nn.Conv2d(up_filter_sizes[0], 1, 1)
-
-    def forward(self, x):
-        xs = []
-        for downsample, down in zip(self.downsamplers, self.down):
-            x_in = x if downsample is None else downsample(xs[-1])
-            x_out = down(x_in)
-            xs.append(x_out)
-
-        x_out = xs[-1]
-        for x_skip, upsample, up in reversed(
-            list(zip(xs[:-1], self.upsamplers, self.up))
-        ):
-            x_out = upsample(x_out)
-            x_out = up(torch.cat([x_out, x_skip], 1))
-
-        if self.add_output:
-            x_out1 = self.conv_final1(x_out)
-            x_out2 = self.conv_final2(x_out)
-            x_out3 = self.conv_final3(x_out)
-            if self.num_classes > 1:
-                x_out1 = F.log_softmax(x_out1, dim=1)
-                x_out2 = F.log_softmax(x_out2, dim=1)
-            x_out3 = F.sigmoid(x_out3)
-
-        # return x_out,x_out1,x_out2,x_out3
-        return [x_out1, x_out2, x_out3]
+x = torch.rand([1,2,320,320])
+y = model(x)
+print (y.shape)
+'''
+ 

@@ -1,194 +1,301 @@
-import torch
-import os
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
-import glob
-from torch.optim import Adam
-from tqdm import tqdm
+import sys
 import logging
-from torch import nn
-import numpy as np
-import h5py
-import torchvision
+import pathlib
 import random
+import shutil
+import time
+import functools
+import numpy as np
+import argparse
+
+import torch
+import torchvision
 from tensorboardX import SummaryWriter
-
-from utils import visualize, evaluate, create_train_arg_parser
-from losses import LossUNet, LossDCAN, LossDMTN, LossPsiNet
-from models import UNet, UNet_DCAN, UNet_DMTN, PsiNet, UNet_ConvMCD
-from dataset import DatasetImageMaskContourDist
-
-
-def define_loss(loss_type, weights=[1, 1, 1]):
-
-    if loss_type == "unet":
-        criterion = LossUNet(weights)
-    if loss_type == "dcan":
-        criterion = LossDCAN(weights)
-    if loss_type == "dmtn":
-        criterion = LossDMTN(weights)
-    if loss_type == "psinet" or loss_type == "convmcd":
-        # Both psinet and convmcd uses same mask,contour and distance loss function
-        criterion = LossPsiNet(weights)
-
-    return criterion
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from dataset import DatasetImageCoord
+from models import UnetModel
+import torchvision
+from torch import nn
+from torch.autograd import Variable
+from torch import optim
+from tqdm import tqdm
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def build_model(model_type):
+def create_datasets(args):
 
-    if model_type == "unet":
-        model = UNet(num_classes=2)
-    if model_type == "dcan":
-        model = UNet_DCAN(num_classes=2)
-    if model_type == "dmtn":
-        model = UNet_DMTN(num_classes=2)
-    if model_type == "psinet":
-        model = PsiNet(num_classes=2)
-    if model_type == "convmcd":
-        model = UNet_ConvMCD(num_classes=2)
+    train_data = DatasetImageCoord(args.train_path,args.acceleration_factor,args.dataset_type)
+    dev_data = DatasetImageCoord(args.validation_path,args.acceleration_factor,args.dataset_type)
 
+    return dev_data, train_data
+
+def create_data_loaders(args):
+
+    dev_data, train_data = create_datasets(args)   
+
+    display_data = [dev_data[i] for i in range(0, len(dev_data), len(dev_data) // 16)]
+
+    train_loader = DataLoader(
+        dataset=train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        #num_workers=64,
+        #pin_memory=True,
+    )
+    dev_loader = DataLoader(
+        dataset=dev_data,
+        batch_size=args.batch_size,
+        #num_workers=64,
+        #pin_memory=True,
+    )
+    display_loader = DataLoader(
+        dataset=display_data,
+        batch_size=16,
+        #num_workers=64,
+        #pin_memory=True,
+    )
+    return train_loader, dev_loader, display_loader
+
+
+def train_epoch(args, epoch, model,data_loader, optimizer, writer):
+    
+    model.train()
+    avg_loss = 0.
+    start_epoch = start_iter = time.perf_counter()
+    global_step = epoch * len(data_loader)
+    #print ("Entering Train epoch")
+
+    for iter, data in enumerate(tqdm(data_loader)):
+
+        #print (data)
+
+        #print ("Received data from loader")
+        input, target = data # Return kspace also we can ignore that for train and test 
+        input = input.unsqueeze(1).to(args.device)
+        target = target.unsqueeze(1).to(args.device)
+
+        input = input.float()
+        target = target.float()
+        #print ("Initialized input and target")
+
+        output = model(input)
+        #print ("Input passed to model")
+        loss = F.l1_loss(output,target)
+        #print ("Loss calculated")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if iter > 0 else loss.item()
+        writer.add_scalar('TrainLoss',loss.item(),global_step + iter )
+
+
+        if iter % args.report_interval == 0:
+            logging.info(
+                f'Epoch = [{epoch:3d}/{args.num_epochs:3d}] '
+                f'Iter = [{iter:4d}/{len(data_loader):4d}] '
+                f'Loss = {loss.item():.4g} Avg Loss = {avg_loss:.4g} '
+                f'Time = {time.perf_counter() - start_iter:.4f}s',
+            )
+        start_iter = time.perf_counter()
+        #break
+
+    return avg_loss, time.perf_counter() - start_epoch
+
+
+def evaluate(args, epoch, model, data_loader, writer):
+
+    model.eval()
+    losses = []
+    start = time.perf_counter()
+    
+    with torch.no_grad():
+        for iter, data in enumerate(tqdm(data_loader)):
+    
+            input, target = data # Return kspace also we can ignore that for train and test
+            input = input.unsqueeze(1).to(args.device)
+            target = target.unsqueeze(1).to(args.device)
+    
+            input = input.float()
+            target = target.float()
+    
+            output = model(input)
+            #loss = F.mse_loss(output,target, size_average=False)
+            loss = F.mse_loss(output,target)
+            
+            losses.append(loss.item())
+            
+        writer.add_scalar('Dev_Loss',np.mean(losses),epoch)
+       
+    return np.mean(losses), time.perf_counter() - start
+
+
+def visualize(args, epoch, model, data_loader, writer):
+    
+    def save_image(image, tag):
+        image -= image.min()
+        image /= image.max()
+        grid = torchvision.utils.make_grid(image, nrow=4, pad_value=1)
+        writer.add_image(tag, grid, epoch)
+
+    model.eval()
+    with torch.no_grad():
+        for iter, data in enumerate(tqdm(data_loader)):
+            input,  = data # Return kspace also we can ignore that for train and test
+            input = input.unsqueeze(1).to(args.device)
+            target = target.unsqueeze(1).to(args.device)
+            output = model(input.float())
+            print("input: ", torch.min(input), torch.max(input))
+            print("target: ", torch.min(target), torch.max(target))
+            print("predicted: ", torch.min(output), torch.max(output))
+            save_image(input, 'Input')
+            save_image(target, 'Target')
+            save_image(output, 'Reconstruction')
+            save_image(torch.abs(target.float() - output.float()), 'Error')
+            break
+
+def save_model(args, exp_dir, epoch, model, optimizer,best_dev_loss,is_new_best):
+
+    out = torch.save(
+        {
+            'epoch': epoch,
+            'args': args,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'best_dev_loss': best_dev_loss,
+            'exp_dir':exp_dir
+        },
+        f=exp_dir / 'model.pt'
+    )
+
+    if is_new_best:
+        shutil.copyfile(exp_dir / 'model.pt', exp_dir / 'best_model.pt')
+
+
+def build_model(args):
+    
+    model = UnetModel(
+        in_chans=1,
+        out_chans=1,
+        chans=args.num_chans,
+        num_pool_layers=args.num_pools,
+        drop_prob=args.drop_prob
+    ).to(args.device)
+    
     return model
 
+def load_model(checkpoint_file):
+    checkpoint = torch.load(checkpoint_file)
+    args = checkpoint['args']
+    model = build_model(args)
 
-def train_model(model, targets, model_type, criterion, optimizer):
+    if args.data_parallel:
+        model = torch.nn.DataParallel(model)
 
-    if model_type == "unet":
+    model.load_state_dict(checkpoint['model'])
 
-        optimizer.zero_grad()
+    optimizer = build_optim(args, model.parameters())
+    optimizer.load_state_dict(checkpoint['optimizer'])
 
-        with torch.set_grad_enabled(True):
-            outputs = model(inputs)
-            loss = criterion(outputs[0], targets[0])
-            loss.backward()
-            optimizer.step()
-
-    if model_type == "dcan":
-
-        optimizer.zero_grad()
-
-        with torch.set_grad_enabled(True):
-            outputs = model(inputs)
-            loss = criterion(outputs[0], outputs[1], targets[0], targets[1])
-            loss.backward()
-            optimizer.step()
-
-    if model_type == "dmtn":
-
-        optimizer.zero_grad()
-
-        with torch.set_grad_enabled(True):
-            outputs = model(inputs)
-            loss = criterion(outputs[0], outputs[1], targets[0], targets[2])
-            loss.backward()
-            optimizer.step()
-
-    if model_type == "psinet" or model_type == "convmcd":
-
-        optimizer.zero_grad()
-
-        with torch.set_grad_enabled(True):
-            outputs = model(inputs)
-            loss = criterion(
-                outputs[0], outputs[1], outputs[2], targets[0], targets[1], targets[2]
-            )
-            loss.backward()
-            optimizer.step()
-
-    return loss
+    return checkpoint, model, optimizer 
 
 
-if __name__ == "__main__":
+def build_optim(args, params):
+    optimizer = torch.optim.Adam(params, args.lr, weight_decay=args.weight_decay)
+    return optimizer
 
-    args = create_train_arg_parser().parse_args()
 
-    CUDA_SELECT = "cuda:{}".format(args.cuda_no)
-    log_path = args.save_path + "/summary"
-    writer = SummaryWriter(log_dir=log_path)
+def main(args):
+    args.exp_dir.mkdir(parents=True, exist_ok=True)
+    #writer = SummaryWriter(logdir=str(args.exp_dir / 'summary'))
+    writer = SummaryWriter(log_dir=str(args.exp_dir / 'summary'))
 
-    logging.basicConfig(
-        filename="".format(args.object_type),
-        filemode="a",
-        format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M",
-        level=logging.INFO,
-    )
-    logging.info("")
+    if args.resume:
+        print('resuming model, batch_size', args.batch_size)
+        #checkpoint, model, optimizer, disc, optimizerD = load_model(args, args.checkpoint)
+        checkpoint, model, optimizer, disc, optimizerD = load_model(args.checkpoint)
+        args = checkpoint['args']
+        args.batch_size = 28
+        best_dev_mse= checkpoint['best_dev_mse']
+        best_dev_ssim = checkpoint['best_dev_mse']
+        start_epoch = checkpoint['epoch']
+        del checkpoint
+    else:
+        model = build_model(args)
+        #print ("Model Built")
+        if args.data_parallel:
+            model = torch.nn.DataParallel(model)    
+        optimizer = build_optim(args, model.parameters())
+        #print ("Optmizer initialized")
+        best_dev_loss = 1e9
+        start_epoch = 0
 
-    train_file_names = glob.glob(os.path.join(args.train_path, "*.jpg"))
-    random.shuffle(train_file_names)
-    val_file_names = glob.glob(os.path.join(args.val_path, "*.jpg"))
+    logging.info(args)
+    logging.info(model)
 
-    device = torch.device(CUDA_SELECT if torch.cuda.is_available() else "cpu")
-    model = build_model(args.model_type)
+    train_loader, dev_loader, display_loader = create_data_loaders(args)
+    #print ("Dataloader initialized")
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
+    
+    for epoch in range(start_epoch, args.num_epochs):
 
-    if torch.cuda.device_count() > 1:
-        print("Let's use", torch.cuda.device_count(), "GPUs!")
-        model = nn.DataParallel(model)
+        scheduler.step(epoch)
+        train_loss,train_time = train_epoch(args, epoch, model,train_loader,optimizer,writer)
+        dev_loss,dev_time = evaluate(args, epoch, model, dev_loader, writer)
+        #visualize(args, epoch, model, display_loader, writer)
 
-    model = model.to(device)
+        is_new_best = dev_loss < best_dev_loss
+        best_dev_loss = min(best_dev_loss,dev_loss)
+        save_model(args, args.exp_dir, epoch, model, optimizer,best_dev_loss,is_new_best)
+        logging.info(
+            f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g}'
+            f'DevLoss= {dev_loss:.4g} TrainTime = {train_time:.4f}s DevTime = {dev_time:.4f}s',
+        )
+    writer.close()
 
-    # To handle epoch start number and pretrained weight
-    epoch_start = "0"
-    if args.use_pretrained:
-        print("Loading Model {}".format(os.path.basename(args.pretrained_model_path)))
-        model.load_state_dict(torch.load(args.pretrained_model_path))
-        epoch_start = os.path.basename(args.pretrained_model_path).split(".")[0]
-        print(epoch_start)
 
-    trainLoader = DataLoader(
-        DatasetImageMaskContourDist(train_file_names, args.distance_type),
-        batch_size=args.batch_size,
-    )
-    devLoader = DataLoader(
-        DatasetImageMaskContourDist(val_file_names, args.distance_type)
-    )
-    displayLoader = DataLoader(
-        DatasetImageMaskContourDist(val_file_names, args.distance_type),
-        batch_size=args.val_batch_size,
-    )
+def create_arg_parser():
 
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    criterion = define_loss(args.model_type)
+    parser = argparse.ArgumentParser(description='Train setup for MR recon U-Net')
+    parser.add_argument('--seed',default=42,type=int,help='Seed for random number generators')
+    parser.add_argument('--num-pools', type=int, default=4, help='Number of U-Net pooling layers')
+    parser.add_argument('--drop-prob', type=float, default=0.0, help='Dropout probability')
+    parser.add_argument('--num-chans', type=int, default=32, help='Number of U-Net channels')
+    parser.add_argument('--batch-size', default=2, type=int,  help='Mini batch size')
+    parser.add_argument('--num-epochs', type=int, default=150, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--lr-step-size', type=int, default=40,
+                        help='Period of learning rate decay')
+    parser.add_argument('--lr-gamma', type=float, default=0.1,
+                        help='Multiplicative factor of learning rate decay')
+    parser.add_argument('--weight-decay', type=float, default=0.,
+                        help='Strength of weight decay regularization')
+    parser.add_argument('--report-interval', type=int, default=100, help='Period of loss reporting')
+    parser.add_argument('--data-parallel', action='store_true', 
+                        help='If set, use multiple GPUs using data parallelism')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Which device to train on. Set to "cuda" to use the GPU')
+    parser.add_argument('--exp-dir', type=pathlib.Path, default='checkpoints',
+                        help='Path where model and results should be saved')
+    parser.add_argument('--resume', action='store_true',
+                        help='If set, resume the training from a previous model checkpoint. '
+                             '"--checkpoint" should be set with this')
+    parser.add_argument('--checkpoint', type=str,
+                        help='Path to an existing checkpoint. Used along with "--resume"')
+    parser.add_argument('--data-path',type=str,help='Path to train h5 files')
+    parser.add_argument('--pos-csv-path',type=str,help='Path to test h5 files')
+    parser.add_argument('--train-csv-path',type=str,help='Path to test h5 files')
+    parser.add_argument('--valid-csv-path',type=str,help='Path to test h5 files')
 
-    for epoch in tqdm(
-        range(int(epoch_start) + 1, int(epoch_start) + 1 + args.num_epochs)
-    ):
+    return parser
 
-        global_step = epoch * len(trainLoader)
-        running_loss = 0.0
 
-        for i, (img_file_name, inputs, targets1, targets2, targets3) in enumerate(
-            tqdm(trainLoader)
-        ):
-
-            model.train()
-
-            inputs = inputs.to(device)
-            targets1 = targets1.to(device)
-            targets2 = targets2.to(device)
-            targets3 = targets3.to(device)
-
-            targets = [targets1, targets2, targets3]
-
-            loss = train_model(model, targets, args.model_type, criterion, optimizer)
-
-            writer.add_scalar("loss", loss.item(), epoch)
-
-            running_loss += loss.item() * inputs.size(0)
-
-        epoch_loss = running_loss / len(train_file_names)
-
-        if epoch % 1 == 0:
-
-            dev_loss, dev_time = evaluate(device, epoch, model, devLoader, writer)
-            writer.add_scalar("loss_valid", dev_loss, epoch)
-            visualize(device, epoch, model, displayLoader, writer, args.val_batch_size)
-            print("Global Loss:{} Val Loss:{}".format(epoch_loss, dev_loss))
-        else:
-            print("Global Loss:{} ".format(epoch_loss))
-
-        logging.info("epoch:{} train_loss:{} ".format(epoch, epoch_loss))
-        if epoch % 5 == 0:
-            torch.save(
-                model.state_dict(), os.path.join(args.save_path, str(epoch) + ".pt")
-            )
+if __name__ == '__main__':
+    args = create_arg_parser().parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    print (args)
+    main(args)
