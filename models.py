@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import os 
 import numpy as np
+from torchvision import models
 
 class ConvBlock(nn.Module):
     """
@@ -165,4 +166,20 @@ x = torch.rand([1,2,320,320])
 y = model(x)
 print (y.shape)
 '''
- 
+
+
+class Posxymodel(nn.Module):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.net = models.resnet34(pretrained=True)
+
+        self.net.fc = nn.Linear(self.net.fc.in_features,2)
+
+    def forward(self,x):
+
+        out = self.net(x)
+
+        return out 

@@ -14,7 +14,7 @@ from tensorboardX import SummaryWriter
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from dataset import DatasetImageCoord
-from models import UnetModel
+from models import Posxymodel
 import torchvision
 from torch import nn
 from torch.autograd import Variable
@@ -26,16 +26,17 @@ logger = logging.getLogger(__name__)
 
 def create_datasets(args):
 
-    train_data = DatasetImageCoord(args.train_path,args.acceleration_factor,args.dataset_type)
-    dev_data = DatasetImageCoord(args.validation_path,args.acceleration_factor,args.dataset_type)
+    train_data = DatasetImageCoord(args.data_path, args.train_csv_path,args.pos_csv_path)
+    dev_data = DatasetImageCoord(args.data_path, args.valid_csv_path, args.pos_csv_path)
 
     return dev_data, train_data
 
 def create_data_loaders(args):
 
     dev_data, train_data = create_datasets(args)   
+    #print (len(dev_data), len(train_data))
 
-    display_data = [dev_data[i] for i in range(0, len(dev_data), len(dev_data) // 16)]
+    display_data = [dev_data[i] for i in range(0, len(dev_data))]
 
     train_loader = DataLoader(
         dataset=train_data,
@@ -73,14 +74,17 @@ def train_epoch(args, epoch, model,data_loader, optimizer, writer):
 
         #print ("Received data from loader")
         input, target = data # Return kspace also we can ignore that for train and test 
-        input = input.unsqueeze(1).to(args.device)
-        target = target.unsqueeze(1).to(args.device)
+        #print (input.shape, target.shape)
+
+        input = input.to(args.device)
+        target = target.to(args.device)
 
         input = input.float()
         target = target.float()
         #print ("Initialized input and target")
 
         output = model(input)
+        #print (output.shape, target.shape)
         #print ("Input passed to model")
         loss = F.l1_loss(output,target)
         #print ("Loss calculated")
@@ -115,8 +119,8 @@ def evaluate(args, epoch, model, data_loader, writer):
         for iter, data in enumerate(tqdm(data_loader)):
     
             input, target = data # Return kspace also we can ignore that for train and test
-            input = input.unsqueeze(1).to(args.device)
-            target = target.unsqueeze(1).to(args.device)
+            input = input.to(args.device)
+            target = target.to(args.device)
     
             input = input.float()
             target = target.float()
@@ -176,13 +180,7 @@ def save_model(args, exp_dir, epoch, model, optimizer,best_dev_loss,is_new_best)
 
 def build_model(args):
     
-    model = UnetModel(
-        in_chans=1,
-        out_chans=1,
-        chans=args.num_chans,
-        num_pool_layers=args.num_pools,
-        drop_prob=args.drop_prob
-    ).to(args.device)
+    model = Posxymodel().to(args.device)
     
     return model
 
