@@ -1,9 +1,10 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-import os 
+import os
 import numpy as np
 from torchvision import models
+
 
 class ConvBlock(nn.Module):
     """
@@ -32,7 +33,7 @@ class ConvBlock(nn.Module):
             nn.Conv2d(out_chans, out_chans, kernel_size=3, padding=1),
             nn.InstanceNorm2d(out_chans),
             nn.ReLU(),
-            nn.Dropout2d(drop_prob)
+            nn.Dropout2d(drop_prob),
         )
 
     def forward(self, input):
@@ -45,8 +46,10 @@ class ConvBlock(nn.Module):
         return self.layers(input)
 
     def __repr__(self):
-        return f'ConvBlock(in_chans={self.in_chans}, out_chans={self.out_chans}, ' \
-            f'drop_prob={self.drop_prob})'
+        return (
+            f"ConvBlock(in_chans={self.in_chans}, out_chans={self.out_chans}, "
+            f"drop_prob={self.drop_prob})"
+        )
 
 
 class UnetModel(nn.Module):
@@ -112,48 +115,50 @@ class UnetModel(nn.Module):
 
         # Apply up-sampling layers
         for layer in self.up_sample_layers:
-            output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
+            output = F.interpolate(
+                output, scale_factor=2, mode="bilinear", align_corners=False
+            )
             output = torch.cat([output, stack.pop()], dim=1)
             output = layer(output)
         return self.conv2(output)
 
-    
+
 class DataConsistencyLayer(nn.Module):
+    def __init__(self, mask_path, acc_factor, device):
 
-    def __init__(self,mask_path,acc_factor,device):
-        
-        super(DataConsistencyLayer,self).__init__()
+        super(DataConsistencyLayer, self).__init__()
 
-        print (mask_path)
-        mask_path = os.path.join(mask_path,'mask_{}.npy'.format(acc_factor))
-        self.mask = torch.from_numpy(np.load(mask_path)).unsqueeze(2).unsqueeze(0).to(device)
+        print(mask_path)
+        mask_path = os.path.join(mask_path, "mask_{}.npy".format(acc_factor))
+        self.mask = (
+            torch.from_numpy(np.load(mask_path)).unsqueeze(2).unsqueeze(0).to(device)
+        )
 
-    def forward(self,us_kspace,predicted_img):
+    def forward(self, us_kspace, predicted_img):
 
         # us_kspace     = us_kspace[:,0,:,:]
-        predicted_img = predicted_img[:,0,:,:]
-        
-        kspace_predicted_img = torch.rfft(predicted_img,2,True,False).double()
+        predicted_img = predicted_img[:, 0, :, :]
+
+        kspace_predicted_img = torch.rfft(predicted_img, 2, True, False).double()
         # print (us_kspace.shape,predicted_img.shape,kspace_predicted_img.shape,self.mask.shape)
-        
-        updated_kspace1  = self.mask * us_kspace 
-        updated_kspace2  = (1 - self.mask) * kspace_predicted_img
 
-        
+        updated_kspace1 = self.mask * us_kspace
+        updated_kspace2 = (1 - self.mask) * kspace_predicted_img
 
-        updated_kspace   = updated_kspace1[:,0,:,:,:] + updated_kspace2
-        
-        
-        updated_img    = torch.ifft(updated_kspace,2,True) 
-        
-        update_img_abs = torch.sqrt(updated_img[:,:,:,0]**2 + updated_img[:,:,:,1]**2)
-        
+        updated_kspace = updated_kspace1[:, 0, :, :, :] + updated_kspace2
+
+        updated_img = torch.ifft(updated_kspace, 2, True)
+
+        update_img_abs = torch.sqrt(
+            updated_img[:, :, :, 0] ** 2 + updated_img[:, :, :, 1] ** 2
+        )
+
         update_img_abs = update_img_abs.unsqueeze(1)
-        
+
         return update_img_abs.float()
 
 
-'''
+"""
 model = UnetModel(
         in_chans=2,
         out_chans=1,
@@ -165,21 +170,20 @@ model = UnetModel(
 x = torch.rand([1,2,320,320])
 y = model(x)
 print (y.shape)
-'''
+"""
 
 
 class Posxymodel(nn.Module):
-
     def __init__(self):
 
         super().__init__()
 
         self.net = models.resnet34(pretrained=True)
 
-        self.net.fc = nn.Linear(self.net.fc.in_features,2)
+        self.net.fc = nn.Linear(self.net.fc.in_features, 2)
 
-    def forward(self,x):
+    def forward(self, x):
 
         out = self.net(x)
 
-        return out 
+        return out

@@ -1,7 +1,7 @@
 BATCH_SIZE=4
 NUM_EPOCHS=50
 DEVICE='cuda:0'
-MODEL='unet'
+MODEL='resnet34'
 
 EXP_DIR='/media/htic/NewVolume3/Balamurali/baby_project/fovea-ets/experiments/'${MODEL}
 
